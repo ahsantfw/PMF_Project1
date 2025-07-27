@@ -1,0 +1,12 @@
+selenium
+webdriver-manager
+sentence-transformers
+spacy
+nltk
+torch
+transformers
+huggingface-hub
+pandas
+praw
+python-dotenv
+PyGithub

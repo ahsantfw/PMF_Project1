@@ -134,7 +134,7 @@ Thumbs.db
 # Output files
 outputs/
 *.txt
-*.json
+# *.json
 !requirements.txt
 !package.json
 !tsconfig.json 
