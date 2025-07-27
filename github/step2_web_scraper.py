@@ -333,7 +333,7 @@ if __name__ == "__main__":
             
             for query in search_queries:
                 print(f"\n--- Query: {query} ---")
-                scraper.search_and_get_issues(query, max_items=100, all_items=all_items_for_category, save_callback=save_if_needed)
+                scraper.search_and_get_issues(query, max_items=10000, all_items=all_items_for_category, save_callback=save_if_needed)
                 print(f"Found {len(all_items_for_category)} total relevant items so far for this category")
 
             print(f"\nTotal items found for category {category_idx}: {len(all_items_for_category)}")

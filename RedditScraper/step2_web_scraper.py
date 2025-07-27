@@ -151,7 +151,7 @@ class RedditScraper:
 
                 # Extract semantically relevant keywords from the text
                 semantic_keywords = self.semantic_analyzer.extract_semantically_relevant_keywords(
-                    text, keywords_list, threshold=0.65
+                    text, keywords_list, threshold=0.80
                 )
                 print(f"✅ Relevant (Score: {cosine_similarity:.2f}): {text[:50]}...")
                 return True, cosine_similarity, semantic_keywords
@@ -268,7 +268,7 @@ if __name__ == "__main__":
             
             for query in search_queries:
                 print(f"\n--- Query: {query} ---")
-                scraper.search_and_get_posts(query, max_posts=300, all_posts=all_posts, save_callback=save_if_needed)
+                scraper.search_and_get_posts(query, max_posts=10000, all_posts=all_posts, save_callback=save_if_needed)
                 print(f"Found {len(all_posts)} total relevant posts so far for this category")
 
             print(f"\nTotal posts found for category {category_idx}: {len(all_posts)}")
