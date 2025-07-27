@@ -59,6 +59,23 @@ def get_search_queries(category_idx: int = 2) -> List[str]:
     
     return all_queries
 
+def get_search_queries(category_idx: int = 2) -> List[str]:
+    """Get a list of individual search queries for a specific category."""
+    categories = load_categories()
+    
+    if len(categories) <= category_idx:
+        print(f"Error: Category index {category_idx} is out of bounds.")
+        return []
+
+    category = categories[category_idx]
+    
+    # Extract terms by splitting the booleans string by 'OR'
+    booleans_str = category['booleans'][0].strip('()')
+    terms = [term.strip() for term in booleans_str.split('OR')]
+    
+    # Remove any empty strings from the list
+    return [term for term in terms if term]
+
 if __name__ == "__main__":
     # Test Step 1
     # Example usage with category_idx = 0 (assuming Data Integration Challenges exists)
@@ -67,8 +84,3 @@ if __name__ == "__main__":
     for i, query in enumerate(queries):
         print(f"Query {i+1}: {query}")
 
-    # You can also test with a non-existent category_idx to see error handling or out-of-bounds.
-    # try:
-    #     queries = get_search_queries(category_idx=999) # Assuming 999 is out of bounds
-    # except IndexError:
-    #     print("\nSuccessfully handled out-of-bounds category index.")

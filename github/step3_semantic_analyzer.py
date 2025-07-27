@@ -1,11 +1,11 @@
 import nltk
 import spacy
-import json
 from sentence_transformers import SentenceTransformer, util
 from typing import List, Dict, Set, Tuple
 from torch import Tensor
 import numpy as np
-import re # Import regex module
+import json
+import re
 
 # Download required data
 nltk.download('punkt', quiet=True)
@@ -32,10 +32,10 @@ class SemanticAnalyzer:
         except Exception as e:
             print(f"Error loading extra stopwords: {e}")
         
+        # Pre-compute embeddings for common terms to speed up processing
         self.cached_embeddings = {}
-
     def _clean_text_for_nlp(self, text: str) -> str:
-        """Removes common HTML tags and URLs from text before NLP processing."""
+        """Removes common HTML tags, URLs, and markdown formatting from text before NLP processing."""
         # Remove HTML tags
         clean_text = re.sub(r'<[^>]+>', '', text)
         # Remove URLs
@@ -46,138 +46,127 @@ class SemanticAnalyzer:
         clean_text = re.sub(r'!\[(.*?)\]\(.*?\)', r'\1', clean_text)
         # Replace multiple spaces with a single space
         clean_text = re.sub(r'\s+', ' ', clean_text).strip()
-        return clean_text
-
-    def extract_semantically_relevant_keywords(
-        self,
-        article_text: str,
-        search_terms: List[str],
-        threshold: float = 0.85 
-    ) -> Dict[str, str]:
-        """
-        Extracts keywords from an article that are semantically similar to search terms.
-        This includes robust cleaning and filtering of potential keywords.
-        """
-        semantically_relevant_keywords: Dict[str, str] = {}
-        
-        # Clean the article text before NLP processing
-        cleaned_article_text = self._clean_text_for_nlp(article_text)
-        doc = self.nlp(cleaned_article_text)
-        
-        # Extract potential keywords (nouns and named entities)
-        potential_keywords_raw: List[str] = []
-        for chunk in doc.noun_chunks:
-            potential_keywords_raw.append(chunk.text)
-        for ent in doc.ents:
-            potential_keywords_raw.append(ent.text)
-            
-        # Add single nouns and proper nouns
-        for token in doc:
-            if token.pos_ in ['NOUN', 'PROPN'] and token.text.lower() not in self.stopwords:
-                potential_keywords_raw.append(token.text)
-        
-        # Define common non-semantic prefixes to filter out
-        non_semantic_prefixes = {
-            'a ', 'an ', 'the ', 'some ', 'any ', 'this ', 'that ', 'these ', 'those ',
-            'my ', 'your ', 'his ', 'her ', 'its ', 'our ', 'their ', 'more ', 'less ',
-            'many ', 'few ', 'several ', 'such '
-        }
-        # Convert search terms to lowercase for efficient checking
-        search_terms_lower = {term.lower() for term in search_terms}
-
-        potential_keywords: List[str] = []
-        unwanted_patterns = [
-            r'</summary', r'</a>', r'\+[0-9]+', r'^\s*[-=]\s*$', 
-            r'Context:', r'AI', r'Framework', r'Silos',
-            r'^[0-9]+$', 
-            r'^\W+$', 
-            r'\b(?:http|https|www)\b', 
-            r'\b[a-zA-Z]\b'
-        ]
-
-        for kw in set(potential_keywords_raw): # Use set to get unique keywords
-            kw_stripped = kw.strip()
-            if not kw_stripped:
-                continue
-            
-            # Filter out very short keywords that are not meaningful
-            if len(kw_stripped) < 2 and not kw_stripped.isalnum():
-                continue
-
-            # Filter out keywords containing HTML/XML tags
-            if '<' in kw_stripped or '>' in kw_stripped:
-                continue
-
-            # Filter out keywords matching general unwanted patterns
-            if any(re.search(pattern, kw_stripped, re.IGNORECASE) for pattern in unwanted_patterns):
-                continue
-
-            # Further filter out if the keyword is mostly non-alphanumeric (e.g., '---', '===' or just symbols)
-            alphanumeric_chars = sum(c.isalnum() for c in kw_stripped)
-            if len(kw_stripped) > 0 and alphanumeric_chars / len(kw_stripped) < 0.5:
-                continue
-            
-            # --- NEW FILTERING LOGIC for prefixes like "more data silos" ---
-            filtered_by_prefix = False
-            for prefix in non_semantic_prefixes:
-                if kw_stripped.lower().startswith(prefix):
-                    core_keyword_candidate = kw_stripped[len(prefix):].strip()
-                    
-                    # If the core part is empty or a stopword, or if the original keyword
-                    # is not an exact search term, and the prefix is one we want to specifically
-                    # filter aggressively (like "more " or "your "), then filter it out.
-                    if (not core_keyword_candidate or core_keyword_candidate.lower() in self.stopwords) or \
-                       (prefix in ['more ', 'your '] and kw_stripped.lower() not in search_terms_lower):
-                       filtered_by_prefix = True
-                       break
-            
-            if filtered_by_prefix:
-                continue
-            # --- END NEW FILTERING LOGIC ---
-
-            potential_keywords.append(kw_stripped)
-            
-        if not potential_keywords:
-            return {}
+        return clean_text    
+    
+    
+    def _analyze_text_relevance(self, text: str, keywords: str):
+        """Helper to analyze relevance of a given text and extract new keywords."""
+        if not text or not keywords:
+            return False, 0, {}
 
         try:
-            search_term_embeddings = self.model.encode(search_terms, convert_to_tensor=True)
-            keyword_embeddings = self.model.encode(potential_keywords, convert_to_tensor=True)
+            keywords_list = [term.strip() for term in keywords.replace('(', '').replace(')', '').split('OR')]
+            to_be_matched_embeddings = self.model.encode(keywords_list, convert_to_tensor=True)
             
-            cosine_similarities = util.cos_sim(keyword_embeddings, search_term_embeddings)
+            article_embeddings = self.model.encode(text, convert_to_tensor=True)
+            
+            cosine_similarity = util.semantic_search(article_embeddings, to_be_matched_embeddings, top_k=1)[0][0]['score']
 
-            for i, keyword in enumerate(potential_keywords):
-                max_similarity, matched_term_index = cosine_similarities[i].max(dim=0)
-                
-                if max_similarity >= threshold:
-                    matched_search_term = search_terms[matched_term_index.item()]
-                    
-                    if matched_search_term not in semantically_relevant_keywords or \
-                       max_similarity > util.cos_sim(self.model.encode(semantically_relevant_keywords[matched_search_term]), self.model.encode(matched_search_term)):
-                        semantically_relevant_keywords[matched_search_term] = keyword
-        
-            print(f"Found {len(semantically_relevant_keywords)} semantically relevant keywords: {semantically_relevant_keywords}")
-            return semantically_relevant_keywords
-
+            if cosine_similarity >= 0.35:
+                semantic_keywords = self.extract_semantically_relevant_keywords(
+                    text, keywords_list, threshold=0.75
+                )
+                return True, cosine_similarity, semantic_keywords
+            
+            return False, cosine_similarity, {}
         except Exception as e:
-            print(f"Error in keyword extraction: {e}")
+            print(f"Error in semantic analysis: {e}")
+            return False, 0, {}
+    
+    def extract_semantically_relevant_keywords(self, article_text: str, search_terms: str, threshold: float = 0.8) -> Dict[str, str]:
+        """
+        Extract semantically relevant keywords from article text with comprehensive preprocessing.
+        """
+        # Comprehensive preprocessing
+       
+        
+        cleaned_article_text = self._clean_text_for_nlp(article_text)
+        cleaned_article_text = cleaned_article_text.lower().strip()
+        
+        # 2. Tokenize article into words (not sentences)
+        article_words = article_text.split()
+        
+        # 3. Preprocess search terms - handle both string and list inputs
+        if isinstance(search_terms, str):
+            search_terms_clean = [term.strip() for term in search_terms.split(' OR ')]
+        else:
+            search_terms_clean = [term.strip() for term in search_terms]
+        
+        # 4. Extract and clean article tokens in one pass
+        article_tokens_clean = []
+        for word in article_words:
+            # Clean the word
+            clean_word = re.sub(r'[^\w]', '', word.lower())
+            if (clean_word not in self.stopwords and 
+                len(clean_word) > 2 and 
+                clean_word.isalpha() and
+                clean_word not in [term.lower() for term in search_terms_clean]):
+                article_tokens_clean.append(clean_word)
+        
+        # 5. Remove duplicates
+        article_tokens_clean = list(set(article_tokens_clean))
+        
+        # print(f"Debug: Found {len(article_tokens_clean)} candidate tokens: {article_tokens_clean[:10]}...")
+        # print(f"Debug: Search terms: {search_terms_clean}")
+        
+        if not article_tokens_clean or not search_terms_clean:
+            print("Debug: No candidate tokens or search terms found")
             return {}
+        
+        # 6. Batch encode all tokens and search terms at once
+        all_texts = article_tokens_clean + search_terms_clean
+        all_embeddings = self.model.encode(all_texts, convert_to_tensor=True, show_progress_bar=False)
+        
+        # 7. Split embeddings
+        article_embeddings = all_embeddings[:len(article_tokens_clean)]
+        search_terms_embeddings = all_embeddings[len(article_tokens_clean):]
+        
+        # 8. Calculate similarity matrix efficiently
+        sim_matrix = util.cos_sim(article_embeddings, search_terms_embeddings)
+        
+        # 9. Find semantically relevant keywords with their matched search terms
+        semantically_relevant_keywords = {}
+        
+        for i, article_token in enumerate(article_tokens_clean):
+            # Get similarity scores to all search terms
+            similarities = sim_matrix[i]
+            max_similarity = similarities.max().item()
+            matched_search_term_idx = similarities.argmax().item()
+            
+            # print(f"Debug: Token '{article_token}' - max similarity: {max_similarity:.3f} with '{search_terms_clean[matched_search_term_idx]}'")
+            
+            if max_similarity >= threshold:
+                matched_search_term = search_terms_clean[matched_search_term_idx]
+                semantically_relevant_keywords[matched_search_term] = article_token
+                print(f"Debug: Added keyword '{article_token}' matched with '{matched_search_term}' (similarity: {max_similarity:.3f})")
+                
+        print(f"Found {len(semantically_relevant_keywords)} semantically relevant keywords: {semantically_relevant_keywords}")
+        return semantically_relevant_keywords
 
-    def process_article_fast(self, article: Dict[str, str], search_terms: List[str]):
-        pass
     
-    def check_relevance(self, article_text: str, search_terms: List[str]) -> bool:
-        pass
     
-    def calculate_relevance(self, article_text: str, search_terms: List[str]) -> float:
-        pass
 
 if __name__ == "__main__":
+    # Test Step 3 with speed improvements
     analyzer = SemanticAnalyzer()
     
-    test_article_text = 'Data silos are a major challenge in enterprise environments. Organizations struggle with isolated data repositories that prevent effective data integration and analytics. Modern data architecture solutions help break down these silos. Companies are implementing data lakes and data warehouses to centralize their information. <p>Some irrelevant stuff.</p> Visit our <a href="http://example.com">website</a>. Context:</summary> This is some AI</a > related text. CODE is important. Which System? + 19 - = More data silos, your data silos, a data lake, the system, some solutions.'
+    # Test article with data silos example
+    test_article = {
+        'title': 'Breaking Down Data Silos in Enterprise',
+        'content': 'Data silos are a major challenge in enterprise environments. Organizations struggle with isolated data repositories that prevent effective data integration and analytics. Modern data architecture solutions help break down these silos. Companies are implementing data lakes and data warehouses to centralize their information.'
+    }
     
-    search_terms = ['data silo', 'data silos', 'data integration', 'AI', 'system', 'code', 'data lake', 'solutions']
+    search_terms = ['data silos', 'enterprise data', 'data integration']
     
-    keywords = analyzer.extract_semantically_relevant_keywords(test_article_text, search_terms)
-    print(f"Semantic keywords from test article: {keywords}")
+    # Test fast processing
+    import time
+    start_time = time.time()
+    
+    # is_relevant, keywords = analyzer.process_article_fast(test_article, search_terms)
+    keywords = analyzer.extract_semantically_relevant_keywords(test_article['content'], search_terms)
+    
+    end_time = time.time()
+    print(f"Processing time: {end_time - start_time:.3f} seconds")
+    # print(f"Relevant: {is_relevant}")
+
+    print(f"Semantic keywords: {keywords}")

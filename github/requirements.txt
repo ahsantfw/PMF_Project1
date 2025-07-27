@@ -10,3 +10,6 @@ pandas
 praw
 python-dotenv
 PyGithub
+python-dotenv
+
+# python -m spacy download en_core_web_sm
