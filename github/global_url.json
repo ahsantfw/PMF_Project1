@@ -1,5 +1,24 @@
 {
   "articles_global_urls": [
-    "https://github.com/Sinar/sinarproject.org/issues/61"
+    "https://github.com/hackforla/product-management/issues/386",
+    "https://github.com/zarr-developers/VirtualiZarr/issues/218",
+    "https://github.com/lod-services/survey/issues/9",
+    "https://github.com/tobiashofmann/sap-dev-tech-radar/issues/16",
+    "https://github.com/FlowFuse/website/issues/2796",
+    "https://github.com/ruvnet/ruv-FANN/issues/69",
+    "https://github.com/dotnet/orleans/issues/9586",
+    "https://github.com/systemd/systemd/issues/37779",
+    "https://github.com/ERA-Projects/era-project-rus/issues/6",
+    "https://github.com/jonathanpopham/ghostie/issues/7",
+    "https://github.com/cncf/toc/issues/1746",
+    "https://github.com/memgraph/memgraph/issues/1349",
+    "https://github.com/w3c-cg/ai-agent-protocol/issues/13",
+    "https://github.com/cncf/toc/issues/1657",
+    "https://github.com/uncefact/spec-untp/issues/277",
+    "https://github.com/oxidecomputer/omicron/issues/8334",
+    "https://github.com/w3c-cg/ai-agent-protocol/issues/7",
+    "https://github.com/Cratis/Chronicle/issues/1405",
+    "https://github.com/cube-js/cube/issues/7995",
+    "https://github.com/dpeuscher/rss-reader/issues/178"
   ]
 }

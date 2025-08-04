@@ -1,53 +1,103 @@
-from typing import List, Dict, Optional
+import re
+from datetime import datetime, timedelta
+from typing import Any, Dict, List, Tuple
+from urllib.parse import urlparse
+
+from langdetect import LangDetectException, detect
+
 
 class PlatformSpecific:
     def __init__(self):
         pass
 
-    def _extract_and_analyze_issue_comments(self, issue, top_n: int = 10) -> List[Dict]:
+    def _item_passes_filters(self, item: Any, promotional_keywords: List[str], blacklisted_domains: List[str]) -> Tuple[bool, str]:
+       
+        post_content = item.body or ""
+        post_title = item.title or ""
+        full_text = f"{post_title} {post_content}"
+        reaction_count = 0
+        if hasattr(item, 'reactions'):
+            if hasattr(item.reactions, 'total_count'):
+                reaction_count = item.reactions.total_count
+            elif isinstance(item.reactions, dict):
+                reaction_count = item.reactions.get('total_count', 0)
+        if len(post_content) < 100:
+            return False, "Content length is less than 100 characters"
+        if len(post_content.split()) < 10:
+            return False, "Word count is less than 10 words"
+        age_in_days = (datetime.now(item.created_at.tzinfo) - item.created_at).days
+        if age_in_days > 730:
+            return False, f"Post is too old ({age_in_days} days)"
+        try:
+            lang = detect(full_text)
+            if lang != 'en':
+                return False, f"Language not English (detected: {lang})"
+        except LangDetectException:
+            return False, "Language could not be detected"
+        if not (reaction_count >= 2 or item.comments >= 3):
+            return False, f"Low engagement (Reactions: {reaction_count}, Comments: {item.comments})"
+        for keyword in promotional_keywords:
+            if keyword in full_text.lower():
+                return False, f"Contains promotional keyword: '{keyword}'"
+        urls = re.findall(r'http[s]?://(?:[a-zA-Z]|[0-9]|[$-_@.&+]|[!*\\(\\),]|(?:%[0-9a-fA-F][0-9a-fA-F]))+', post_content)
+        num_links = len(urls)
+        num_words = len(post_content.split())
+        if num_words > 0:
+            link_ratio = num_links / num_words
+            if link_ratio > 0.30:
+                return False, f"Exceeds max link ratio ({link_ratio:.2f} > 0.30)"
+        for url in urls:
+            domain = urlparse(url).netloc
+            if domain in blacklisted_domains:
+                return False, f"Contains blacklisted domain: '{domain}'"
+        return True, "Passed"
+
+    def _get_top_relevant_comments(self, issue: Any, semantic_analyzer: Any, global_keywords: str, verbose_logging: bool, relevance_threshold: float, top_n: int = 5) -> (List[Dict], Dict):
         """
-        Extract and analyze comments for relevance from a GitHub Issue/PR.
-        Limits the output to the top_n most relevant comments.
+        Updated to accept verbose_logging to control print statements.
         """
-        all_relevant_comments_with_scores = []
+        scored_comments = []
         try:
             for comment in issue.get_comments():
                 comment_text = comment.body
                 if comment_text:
-                    is_comment_relevant, relevance_score, new_keywords = self._analyze_text_relevance(comment_text, self.global_keywords)
-                    # print(f"  Comment Relevance Score: {relevance_score:.4f} (Threshold: 0.35)") # Moved this print to _process_comment for consistency
+                    is_relevant, score, new_keywords = semantic_analyzer._analyze_text_relevance(comment_text, global_keywords, relevance_threshold=relevance_threshold)
+                    if verbose_logging: # Use the passed-in parameter
+                        print(f"  Comment Relevance Score: {score:.4f} (Threshold: 0.35)")
                     
-                    if is_comment_relevant:
-                        # Store comment data along with its score
-                        comment_data = {
-                            'id': comment.id,
-                            'author': str(comment.user.login) if comment.user else "N/A",
-                            'text': comment_text,
-                            'relevance_score': relevance_score,
-                            'replies': [] # GitHub comments are not nested
-                        }
-                        all_relevant_comments_with_scores.append((relevance_score, comment_data, new_keywords))
-                        # Update global keywords immediately when a relevant comment is found
-                        self._update_global_keywords(new_keywords)
-
+                    if is_relevant:
+                        scored_comments.append({
+                            "score": score,
+                            "comment_obj": comment,
+                            "new_keywords": new_keywords
+                        })
         except Exception as e:
             print(f"Error extracting comments for item {issue.id}: {e}")
+            return [], {}
         
-        # Sort by relevance score in descending order
-        all_relevant_comments_with_scores.sort(key=lambda x: x[0], reverse=True)
+        scored_comments.sort(key=lambda x: x['score'], reverse=True)
+        top_scored_comments = scored_comments[:top_n]
         
-        # Select top N comments
-        top_n_comments_data = [comment_tuple[1] for comment_tuple in all_relevant_comments_with_scores[:top_n]]
-        
-        # This print statement should happen for each individual comment analysis, not here for the list
-        # For overall summary, we can print how many top comments were selected.
-        print(f"  Selected top {len(top_n_comments_data)} relevant comments.")
+        final_comments_data = []
+        final_new_keywords = {}
+        for item in top_scored_comments:
+            comment_obj = item['comment_obj']
+            final_comments_data.append({
+                'id': comment_obj.id,
+                'author': str(comment_obj.user.login) if comment_obj.user else "N/A",
+                'text': comment_obj.body,
+                'relevance_score': item['score'],
+                'replies': []
+            })
+            final_new_keywords.update(item['new_keywords'])
 
-        return top_n_comments_data
-    
-    def _extract_issue_data(self, item) -> Dict:
-        """Extract relevant data from a PyGithub Issue or Pull Request object."""
-        # Safely get reaction_score
+        if verbose_logging: 
+            print(f"  Selected top {len(final_comments_data)} relevant comments and aggregated their keywords.")
+
+        return final_comments_data, final_new_keywords
+
+    def _extract_issue_data(self, item: Any) -> Dict:
+        
         reaction_score = 0
         if hasattr(item, 'reactions') and item.reactions is not None:
             if hasattr(item.reactions, 'total_count'):
@@ -57,7 +107,6 @@ class PlatformSpecific:
                     reaction_score = item.reactions.get('total_count', 0)
                 except AttributeError:
                     reaction_score = 0
-
         return {
             'id': item.id,
             'url': item.html_url,
@@ -65,39 +114,6 @@ class PlatformSpecific:
             'content': item.body,
             'author': str(item.user.login) if item.user else "N/A",
             'date': item.created_at.isoformat(),
-            'reaction_score': reaction_score, 
-            'comments_count': item.comments 
+            'reaction_score': reaction_score,
+            'comments_count': item.comments
         }
-    
-    def _process_comment(self, comment) -> Optional[Dict]:
-        """
-        Process a single GitHub comment.
-        This function is now primarily for analyzing and extracting data,
-        with the filtering/limiting done by _extract_and_analyze_issue_comments.
-        """
-        # The core logic for relevance analysis and keyword extraction for a single comment
-        # is performed here. The decision to include it in the final list and limit the number
-        # is handled by the calling function.
-        relevant_comment_data = None
-        comment_text = comment.body
-        if comment_text:
-            is_comment_relevant, relevance_score, new_keywords = self._analyze_text_relevance(comment_text, self.global_keywords)
-            print(f"  Comment Relevance Score: {relevance_score:.4f} (Threshold: 0.4)")
-
-            if is_comment_relevant:
-                relevant_comment_data = {
-                    'id': comment.id,
-                    'author': str(comment.user.login) if comment.user else "N/A",
-                    'text': comment_text,
-                    'relevance_score': relevance_score,
-                    'replies': [] # GitHub comments are not nested
-                }
-                # Note: Keyword updating for comments is now done in _extract_and_analyze_issue_comments
-                # to ensure keywords are updated even if the comment isn't in the top N final list.
-                # However, to be consistent with previous runs that updated global keywords on ANY relevant comment,
-                # I'll keep the _update_global_keywords call here. If performance is an issue or
-                # a stricter definition of "global" keywords is desired (only from top N comments),
-                # this could be moved. For now, maintaining prior behavior of updating keywords for any relevant comment.
-                self._update_global_keywords(new_keywords)
-                
-        return relevant_comment_data

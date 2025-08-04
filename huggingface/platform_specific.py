@@ -1,307 +1,147 @@
-from typing import List, Dict, Optional, Any
-from datetime import datetime
-import requests
 import os
-import re # Import regex module
-from step3_semantic_analyzer import SemanticAnalyzer
-from huggingface_hub import HfApi, list_models, list_datasets, list_spaces # Import list_spaces
+import re
+from datetime import datetime, timezone
+from typing import Dict, List, Set
+from urllib.parse import urlparse
 
-# Define a base URL for the Hugging Face API 
-HUGGINGFACE_API_BASE_URL = "https://huggingface.co/api"
+from huggingface_hub import HfApi, list_datasets, list_models, list_spaces
+from langdetect import LangDetectException, detect
+import requests
+
 
 class PlatformSpecific:
     def __init__(self, semantic_analyzer, utils):
         self.semantic_analyzer = semantic_analyzer
         self.utils = utils
-        self.hf_api_token = os.getenv("HF_API_TOKEN") 
+        self.hf_api_token = os.getenv("HF_API_TOKEN")
         if not self.hf_api_token:
-            raise ValueError("HF_API_TOKEN not found in .env file. Please generate a token and add it.")
-        
-        # Initialize Hugging Face Hub API client
+            raise ValueError("HF_API_TOKEN not found in .env file.")
         self.hf_client = HfApi(token=self.hf_api_token)
 
-    # --- Hugging Face Specific Functions (using huggingface_hub) ---
+    def _item_passes_filters(self, item: Dict, description: str, filter_config: Dict) -> (bool, str):
+        """Applies a series of pre-filters to a Hugging Face item using its description."""
+        # Content Filters
+        if len(description) < filter_config.get('min_post_length', 100):
+            return False, f"Content too short ({len(description)} chars)."
+        if len(description.split()) < filter_config.get('min_word_count', 10):
+            return False, f"Not enough words ({len(description.split())} words)."
+        try:
+            if detect(description) != 'en':
+                return False, "Language not English."
+        except LangDetectException:
+            return False, "Language detection failed."
 
-    def _search_huggingface_items(self, query: str, limit: int = 100, item_type: str = "all") -> List[Dict]:
+        # Age Filter
+        created_at = item.get('created_at')
+        if created_at:
+            age_days = (datetime.now(timezone.utc) - created_at).days
+            if age_days > filter_config.get('max_age_days', 730):
+                return False, f"Too old ({age_days} days)."
+
+        # Engagement Filter
+        item_type = item.get('type')
+        reactions = item.get('downloads', 0) if item_type != 'space' else item.get('likes', 0)
+        if reactions < filter_config.get('min_engagement', 10):
+            return False, f"Not enough engagement ({reactions})."
+
+        # Spam Prevention
+        link_count = len(re.findall(r'https?://', description))
+        word_count = len(description.split())
+        link_ratio = (link_count / word_count) if word_count else 0
+        if link_ratio > filter_config.get('max_link_ratio', 0.3):
+            return False, f"Too many links (ratio: {link_ratio:.2f})."
+        if any(domain in description for domain in filter_config.get('blacklisted_domains', [])):
+            return False, "Contains blacklisted domain."
+        if any(kw in description.lower() for kw in filter_config.get('promo_keywords', [])):
+            return False, "Detected as promotional content."
+
+        return True, "Passed"
+
+    def _search_huggingface_items(self, query: str, stopwords_extra: set, limit: int = 100) -> List[Dict]:
         """
-        Search for Hugging Face models, datasets, and/or spaces based on a query using huggingface_hub.
-        This function will prioritize searching for relevant items based on tags and descriptions.
+        Searches Hugging Face first with the full query for precision, 
+        then with refined keywords as a fallback for broader reach.
         """
-        all_found_items = {} # Use a dictionary to store unique items by their ID
-        
-        # Broad tags to filter models/datasets/spaces
-        broad_hf_tags = [
-            "nlp", "text-classification", "sentiment-analysis", "question-answering",
-            "summarization", "translation", "language-modeling", "embeddings",
-            "computer-vision", "image-classification", "object-detection",
-            "audio", "speech-recognition", "reinforcement-learning",
-            "tabular-classification", "tabular-regression", "timeseries",
-            "diffusers", "stable-diffusion", "generative-ai", "foundation-model",
-            "data", "ml", "database", "analytics", "integration", # Added more data-centric tags
-            "demo", "app", "gradio", "streamlit", "streamlit-app", "interface" # Tags for spaces
-        ]
-        
-        individual_terms = [term.strip().replace('(', '').replace(')', '') for term in query.split('OR') if term.strip()]
-        for term in individual_terms:
-            if term not in broad_hf_tags:
-                broad_hf_tags.append(term)
+        all_found_items = {}
 
-        print(f"Fetching Hugging Face {item_type} using relevant tags: {broad_hf_tags}")
-
-        # Helper to process fetched info and add to all_found_items
         def add_item_to_found(info_obj, current_type):
             item_id = getattr(info_obj, 'id', None)
+            if not item_id or item_id in all_found_items: return False
             
-            if not item_id: 
-                item_id = info_obj.get('id') or info_obj.get('modelId')
+            url_prefix_map = {'model': "https://huggingface.co/", 'dataset': "https://huggingface.co/datasets/", 'space': "https://huggingface.co/spaces/"}
+            all_found_items[item_id] = {
+                'type': current_type, 'id': item_id, 'url': f"{url_prefix_map.get(current_type, '')}{item_id}",
+                'created_at': getattr(info_obj, 'created_at', None), 'likes': getattr(info_obj, 'likes', 0),
+                'downloads': getattr(info_obj, 'downloads', 0), 'author': getattr(info_obj, 'author', 'N/A'),
+                'tags': getattr(info_obj, 'tags', [])
+            }
+            return True
+
+        # --- NEW: Two-Step Search Strategy ---
+        # 1. First, try searching with the full, original query for the most relevant results.
+        print(f"Attempting precise search with full query: '{query}'")
+        for item_type, list_func in [('model', list_models), ('dataset', list_datasets), ('space', list_spaces)]:
+            try:
+                results = list_func(search=query, token=self.hf_api_token, limit=limit)
+                for info in results:
+                    add_item_to_found(info, item_type)
+            except Exception as e:
+                print(f"Error during precise search for {item_type}s: {e}")
+        
+        # 2. If the precise search yields very few results, use the keyword fallback.
+        if len(all_found_items) < 5:
+            print("Precise search yielded few results. Expanding search with keywords.")
+            words = re.findall(r'\b\w+\b', query.lower())
+            search_keywords = [word for word in words if word not in stopwords_extra and len(word) > 2]
+            if not search_keywords: search_keywords = [query] # Fallback if all words are stopwords
             
-            if item_id and item_id not in all_found_items:
-                full_info = None
-                try:
-                    if current_type == 'model':
-                        full_info = self.hf_client.get_model_info(item_id, full=True)
-                    elif current_type == 'dataset':
-                        full_info = self.hf_client.get_dataset_info(item_id, full=True)
-                    elif current_type == 'space':
-                        full_info = self.hf_client.get_space_info(item_id, full=True) # Get full space info
-                except Exception as e:
-                    # print(f"Warning: Could not fetch full info for {current_type} {item_id}: {e}")
-                    full_info = info_obj 
+            print(f"Refined search keywords for Hugging Face: {search_keywords}")
 
-                # Determine URL prefix based on type
-                url_prefix = ""
-                if current_type == 'model': url_prefix = "https://huggingface.co/"
-                elif current_type == 'dataset': url_prefix = "https://huggingface.co/datasets/"
-                elif current_type == 'space': url_prefix = "https://huggingface.co/spaces/"
-
-                all_found_items[item_id] = {
-                    'type': current_type,
-                    'data': getattr(full_info, 'cardData', None) if current_type == 'model' else full_info.__dict__,
-                    'id': item_id,
-                    'url': f"{url_prefix}{item_id}",
-                    'created_at': getattr(full_info, 'created_at', None),
-                    'likes': getattr(full_info, 'likes', 0),
-                    'downloads': getattr(full_info, 'downloads', 0) if current_type != 'space' else getattr(full_info, 'likes', 0), # Spaces use likes for popularity
-                    'author': getattr(full_info, 'author', 'N/A'),
-                    'tags': getattr(full_info, 'tags', [])
-                }
-                return True 
-            return False 
-
-
-        # Search for models
-        if item_type in ["all", "model"]:
-            current_model_count = 0
-            for tag in broad_hf_tags:
-                if current_model_count >= limit: break
-                try:
-                    models_by_search_or_tag = []
-                    models_by_search_or_tag.extend(list_models(search=tag, token=self.hf_api_token, limit=limit))
-                    models_by_search_or_tag.extend(list_models(filter=tag, token=self.hf_api_token, limit=limit))
-                    
-                    for model_info in models_by_search_or_tag:
-                        if add_item_to_found(model_info, 'model'):
-                            current_model_count += 1
-                            if current_model_count >= limit: break
-                except Exception as e:
-                    print(f"Error fetching models for tag '{tag}': {e}")
-            
-            if current_model_count < limit: 
-                try:
-                    print(f"Fetching top downloaded models as fallback (need {limit - current_model_count}).")
-                    models = list_models(sort="downloads", direction=-1, token=self.hf_api_token, limit=limit - current_model_count)
-                    for model_info in models:
-                        add_item_to_found(model_info, 'model')
-                except Exception as e:
-                    print(f"Error fetching top downloaded models: {e}")
-
-        # Search for datasets
-        if item_type in ["all", "dataset"]:
-            current_dataset_count = 0
-            for tag in broad_hf_tags:
-                if current_dataset_count >= limit: break
-                try:
-                    datasets_by_search_or_tag = []
-                    datasets_by_search_or_tag.extend(list_datasets(search=tag, token=self.hf_api_token, limit=limit))
-                    datasets_by_search_or_tag.extend(list_datasets(filter=tag, token=self.hf_api_token, limit=limit))
-                    
-                    for dataset_info in datasets_by_search_or_tag:
-                        if add_item_to_found(dataset_info, 'dataset'):
-                            current_dataset_count += 1
-                            if current_dataset_count >= limit: break
-                except Exception as e:
-                    print(f"Error fetching datasets for tag '{tag}': {e}")
-
-            if current_dataset_count < limit: 
-                try:
-                    print(f"Fetching top downloaded datasets as fallback (need {limit - current_dataset_count}).")
-                    datasets = list_datasets(sort="downloads", direction=-1, token=self.hf_api_token, limit=limit - current_dataset_count)
-                    for dataset_info in datasets:
-                        add_item_to_found(dataset_info, 'dataset')
-                except Exception as e:
-                    print(f"Error fetching top downloaded datasets: {e}")
-
-        # Search for spaces
-        if item_type in ["all", "space"]:
-            current_space_count = 0
-            for tag in broad_hf_tags:
-                if current_space_count >= limit: break
-                try:
-                    print(f"Attempting HF API fetch for spaces with search/tag: '{tag}'")
-                    spaces_by_search_or_tag = []
-                    spaces_by_search_or_tag.extend(list_spaces(search=tag, token=self.hf_api_token, limit=limit))
-                    spaces_by_search_or_tag.extend(list_spaces(filter=tag, token=self.hf_api_token, limit=limit))
-                    
-                    for space_info in spaces_by_search_or_tag:
-                        if add_item_to_found(space_info, 'space'):
-                            current_space_count += 1
-                            if current_space_count >= limit: break
-                except Exception as e:
-                    print(f"Error fetching spaces for tag '{tag}': {e}")
-
-            if current_space_count < limit: 
-                try:
-                    print(f"Fetching top liked spaces as fallback (need {limit - current_space_count}).")
-                    # Spaces are typically sorted by likes for popularity, not downloads
-                    spaces = list_spaces(sort="likes", direction=-1, token=self.hf_api_token, limit=limit - current_space_count)
-                    for space_info in spaces:
-                        add_item_to_found(space_info, 'space')
-                except Exception as e:
-                    print(f"Error fetching top liked spaces: {e}")
+            for keyword in search_keywords:
+                # Avoid re-searching the full query if it was the only keyword
+                if keyword == query and len(all_found_items) > 0:
+                    continue
+                for item_type, list_func in [('model', list_models), ('dataset', list_datasets), ('space', list_spaces)]:
+                    try:
+                        results = list_func(search=keyword, token=self.hf_api_token, limit=limit)
+                        for info in results:
+                            add_item_to_found(info, item_type)
+                    except Exception as e:
+                        print(f"Error fetching {item_type}s for keyword '{keyword}': {e}")
 
         print(f"Total unique items fetched from Hugging Face: {len(all_found_items)}")
         return list(all_found_items.values())
 
     def _get_item_description(self, item_id: str, item_type: str) -> str:
-        """
-        Fetches the full description (README) of a Hugging Face model, dataset, or space
-        and extracts only meaningful English prose, stripping YAML front matter and structured data.
-        """
-        headers = {"Authorization": f"Bearer {self.hf_api_token}"}
-        raw_markdown = ""
+        """Fetches and cleans the README of a Hugging Face item."""
+        url_map = {
+            "model": f"https://huggingface.co/{item_id}/raw/main/README.md",
+            "dataset": f"https://huggingface.co/datasets/{item_id}/raw/main/README.md",
+            "space": f"https://huggingface.co/spaces/{item_id}/raw/main/README.md"
+        }
+        readme_url = url_map.get(item_type)
+        if not readme_url: return ""
+
         try:
-            if item_type == "model":
-                readme_url = f"https://huggingface.co/{item_id}/raw/main/README.md"
-            elif item_type == "dataset":
-                readme_url = f"https://huggingface.co/datasets/{item_id}/raw/main/README.md"
-            elif item_type == "space":
-                readme_url = f"https://huggingface.co/spaces/{item_id}/raw/main/README.md" # Spaces also have README.md
-            else:
-                return ""
-
+            headers = {"Authorization": f"Bearer {self.hf_api_token}"}
             response = requests.get(readme_url, headers=headers)
-            response.raise_for_status()
-            raw_markdown = response.text
-        except requests.exceptions.HTTPError as e:
-            if e.response.status_code in [404, 403]:
-                return ""
-            return ""
-        except requests.exceptions.RequestException as e:
-            print(f"⚠️ Network error fetching README for {item_type} {item_id}: {e}")
-            return ""
+            if response.status_code != 200: return ""
+            # Basic cleaning
+            content = re.sub(r'---(.|\n)*?---', '', response.text) # Remove YAML front matter
+            content = re.sub(r'<[^>]+>', '', content) # Remove HTML
+            return content.strip()
         except Exception as e:
-            print(f"An unexpected error occurred fetching README for {item_type} {item_id}: {e}")
+            print(f"⚠️ Error fetching README for {item_type} {item_id}: {e}")
             return ""
-
-        # --- Content Cleaning and Extraction Logic ---
-        cleaned_content = re.sub(r'^---\s*$(.*?)^---\s*$', '', raw_markdown, flags=re.MULTILINE | re.DOTALL)
-        cleaned_content = re.sub(r'^#+\s*.*$', '', cleaned_content, flags=re.MULTILINE)
-        cleaned_content = re.sub(r'\[(.*?)\]\(.*?\)', r'\1', cleaned_content)
-        cleaned_content = re.sub(r'!\[(.*?)\]\(.*?\)', r'\1', cleaned_content)
-        cleaned_content = re.sub(r'```.*?```', '', cleaned_content, flags=re.DOTALL)
-        cleaned_content = re.sub(r'`(.*?)`', r'\1', cleaned_content)
-        cleaned_content = re.sub(r'^[*-]{3,}$', '', cleaned_content, flags=re.MULTILINE)
-        cleaned_content = re.sub(r'^[*-+\d\.]+\s+', '', cleaned_content, flags=re.MULTILINE)
-        cleaned_content = re.sub(r'^\|.*\|$', '', cleaned_content, flags=re.MULTILINE)
-        cleaned_content = re.sub(r'^\|-+$', '', cleaned_content, flags=re.MULTILINE)
-        cleaned_content = re.sub(r'\s+', ' ', cleaned_content).strip()
-
-        words = cleaned_content.split()
-        if len(words) < 10 or not any(c.isalpha() for c in cleaned_content):
-            return ""
-
-        return cleaned_content
 
     def _extract_item_data(self, item: Dict, content_type: str) -> Dict:
-        """Extract Hugging Face item metadata (model, dataset, or space) with desired fields."""
-        extracted_data = {
-            "platform": "huggingface",
-            "title": item.get('id'),
-            "content": "", 
-            "author": item.get('author', 'N/A'),
-            "url": item.get('url'),
-            "created_date": item.get('created_at').isoformat() if item.get('created_at') else 'N/A',
-            "score": item.get('downloads', 0), # Default to downloads for models/datasets
-            "comments_count": 0, 
-            "scraped_at": datetime.now().isoformat(),
-            "content_type": content_type,
-            "tags": item.get('tags', []),
-            "likes": item.get('likes', 0),
-            "relevance_score": 0.0,
-            "matched_topic": ""
-        }
-        if content_type == "model":
-            extracted_data["model_id"] = item.get('id')
-        elif content_type == "dataset":
-            extracted_data["dataset_id"] = item.get('id')
-        elif content_type == "space":
-            extracted_data["space_id"] = item.get('id')
-            extracted_data["score"] = item.get('likes', 0) # Use likes for spaces as their popularity metric
-
-        return extracted_data
-
-    def _extract_and_analyze_discussions(self, item_id: str, item_type: str, global_keywords: str, stopwords_extra: set, top_n: int = 5) -> List[Dict]:
-        """
-        Fetches discussions (issues/pull requests) for a Hugging Face item and analyzes them for relevance.
-        Note: Direct API for Hugging Face item discussions is not straightforward. Skipping discussion analysis for now.
-        """
-        return []
-
-    # --- Original Stack Overflow Specific Functions (kept for context, will be removed if no longer needed) ---
-
-    def _extract_post_data(self, post: Dict) -> Dict:
-        """Extract Stack Overflow question metadata in GitHub-style format."""
+        """Extracts and formats key data from a Hugging Face item."""
         return {
-            'id': post['question_id'],
-            'url': post['link'],
-            'title': post['title'],
-            'content': post.get('body', ''),
-            'author': post.get('owner', {}).get('display_name', 'N/A'),
-            'date': post.get('creation_date', 'N/A'),
-            'reaction_score': post.get('score', 0),
-            'comments_count': post.get('answer_count', 0)
+            "platform": "huggingface", "title": item.get('id'), "content": "",
+            "author": item.get('author', 'N/A'), "url": item.get('url'),
+            "created_date": item.get('created_at').isoformat() if item.get('created_at') else 'N/A',
+            "score": item.get('downloads', 0) if content_type != 'space' else item.get('likes', 0),
+            "comments_count": 0, "scraped_at": datetime.now().isoformat(), "content_type": content_type,
+            "tags": item.get('tags', []), "likes": item.get('likes', 0),
+            "relevance_score": 0.0, "matched_topic": ""
         }
-
-    def _extract_and_analyze_answers(self, question_id: int, global_keywords: str, stopwords_extra: set, top_n: int = 10) -> List[Dict]:
-        """Fetch and analyze Stack Overflow answers for relevance."""
-        all_relevant_answers = []
-        try:
-            response = requests.get(
-                f"https://api.stackexchange.com/2.3/questions/{question_id}/answers",
-                params={
-                    "order": "desc",
-                    "sort": "votes",
-                    "site": "stackoverflow",
-                    "filter": "withbody",
-                    "key": os.getenv("STACKOVERFLOW_API_TOKEN")
-                }
-            )
-            answers = response.json().get('items', [])
-            updated_keywords = global_keywords
-            for answer in answers:
-                answer_text = answer.get('body', '')
-                is_relevant, score, new_keywords = self.semantic_analyzer._analyze_text_relevance(answer_text, updated_keywords)
-                if is_relevant:
-                    answer_data = {
-                        'id': answer['answer_id'],
-                        'author': answer.get('owner', {}).get('display_name', 'N/A'),
-                        'text': answer_text,
-                        'relevance_score': score,
-                        'replies': []
-                    }
-                    all_relevant_answers.append((score, answer_data, new_keywords))
-                    updated_keywords = self.utils._update_global_keywords(new_keywords, updated_keywords, stopwords_extra)
-        except Exception as e:
-            print(f"Error retrieving answers for question {question_id}: {e}")
-        all_relevant_answers.sort(key=lambda x: x[0], reverse=True)
-        return [a[1] for a in all_relevant_answers[:top_n]]

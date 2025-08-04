@@ -9,9 +9,6 @@ huggingface-hub
 pandas
 praw
 python-dotenv
-PyGithub
-python-dotenv
 langdetect
-beautifulsoup4
 
 # python -m spacy download en_core_web_sm
